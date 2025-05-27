@@ -64,7 +64,7 @@ class Introduction(BaseModel):
 @tool
 class Conclusion(BaseModel):
     name: str = Field(
-        description="Name for the conclusion of the report.",
+        description="The name for the conclusion of the report.",
     )
     content: str = Field(
         description="The content of the conclusion, summarizing the report."
@@ -108,13 +108,17 @@ async def supervisor(state: ReportState, config: RunnableConfig):
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
     supervisor_model = get_config_value(configurable.supervisor_model)
+    supervisor_provider = get_config_value(configurable.supervisor_provider)
     
     # Initialize the model
-    llm = init_chat_model(model=supervisor_model)
+    llm = init_chat_model(model=supervisor_model,
+                          model_provider=supervisor_provider)
     
     # If sections have been completed, but we don't yet have the final report, then we need to initiate writing the introduction and conclusion
     if state.get("completed_sections") and not state.get("final_report"):
-        research_complete_message = {"role": "user", "content": "Research is complete. Now write the introduction and conclusion for the report. Here are the completed main body sections: \n\n" + "\n\n".join([s.content for s in state["completed_sections"]])}
+        research_complete_message = {
+            "role": "user", 
+            "content": "Research is complete. Now write the introduction and conclusion for the report. Here are the completed main body sections: \n\n" + "\n\n".join([s["content"] for s in state["completed_sections"]])}
         messages = messages + [research_complete_message]
 
     # Get tools based on configuration
@@ -123,7 +127,9 @@ async def supervisor(state: ReportState, config: RunnableConfig):
     # Invoke
     return {
         "messages": [
-            await llm.bind_tools(supervisor_tool_list, parallel_tool_calls=False).ainvoke(
+            await llm.bind_tools(supervisor_tool_list
+                                 # parallel_tool_calls=False
+                                 ).ainvoke(
                 [
                     {"role": "system",
                      "content": SUPERVISOR_INSTRUCTIONS,
@@ -181,6 +187,7 @@ async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Comma
     if sections_list:
         # Send the sections to the research agents
         return Command(goto=[Send("research_team", {"section": s}) for s in sections_list], update={"messages": result})
+  
     elif intro_content:
         # Store introduction while waiting for conclusion
         # Append to messages to guide the LLM to write conclusion next
@@ -189,7 +196,10 @@ async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Comma
     elif conclusion_content:
         # Get all sections and combine in proper order: Introduction, Body Sections, Conclusion
         intro = state.get("final_report", "")
-        body_sections = "\n\n".join([s.content for s in state["completed_sections"]])
+        body_sections = "\n\n".join([
+            s["content"] for s in state["completed_sections"]
+            if isinstance(s, dict) and "content" in s and s["content"]
+        ])
         
         # Assemble final report in correct order
         complete_report = f"{intro}\n\n{body_sections}\n\n{conclusion_content}"
@@ -221,9 +231,11 @@ async def research_agent(state: SectionState, config: RunnableConfig):
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
     researcher_model = get_config_value(configurable.researcher_model)
+    researcher_provider = get_config_value(configurable.researcher_provider) 
     
     # Initialize the model
-    llm = init_chat_model(model=researcher_model)
+    llm = init_chat_model(model=researcher_model,
+                          model_provider = researcher_provider)
 
     # Get tools based on configuration
     research_tool_list, _ = get_research_tools(config)
@@ -233,8 +245,13 @@ async def research_agent(state: SectionState, config: RunnableConfig):
             # Enforce tool calling to either perform more search or call the Section tool to write the section
             await llm.bind_tools(research_tool_list).ainvoke(
                 [
-                    {"role": "system",
-                     "content": RESEARCH_INSTRUCTIONS.format(section_description=state["section"])
+                    {
+                        "role": "system",
+                        "content": RESEARCH_INSTRUCTIONS.format(section_description=state["section"])
+                    },
+                    {
+                        "role": "user",
+                        "content": state["section"]
                     }
                 ]
                 + state["messages"]
@@ -268,11 +285,19 @@ async def research_agent_tools(state: SectionState, config: RunnableConfig):
         
         # Store the section observation if a Section tool was called
         if tool_call["name"] == "Section":
-            completed_section = observation
+            if hasattr(observation, "args"):
+                completed_section = observation.args
+            elif hasattr(observation, "dict"):
+                completed_section = observation.dict()
+            elif isinstance(observation, dict):
+                completed_section = observation
+            else:
+                raise ValueError(f"Section tool返回了未知类型: {type(observation)}")
     
     # After processing all tools, decide what to do next
     if completed_section:
         # Write the completed section to state and return to the supervisor
+        # print("DEBUG completed_sections:", type(state["completed_sections"][0]), state["completed_sections"][0])
         return {"messages": result, "completed_sections": [completed_section]}
     else:
         # Continue the research loop for search tools, etc.
@@ -327,5 +352,8 @@ supervisor_builder.add_conditional_edges(
     },
 )
 supervisor_builder.add_edge("research_team", "supervisor")
+
+# def supervisor_end(state: ReportState, config: RunnableConfig):
+#     return {"final_report": state.get("final_report", "")}
 
 graph = supervisor_builder.compile()
